@@ -111,6 +111,16 @@ transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_sam
     
     const auto & text_hparams = encoder_.get_text_hparams();
     int32_t n_audio_frames = audio_features.size() / text_hparams.hidden_size;
+    if (const char* dp = getenv("QWEN_DUMP_FEATURES")) {
+        FILE* fdump = fopen(dp, "wb");
+        if (fdump) {
+            int32_t dims[2] = { n_audio_frames, (int32_t)text_hparams.hidden_size };
+            fwrite(dims, sizeof(int32_t), 2, fdump);
+            fwrite(audio_features.data(), sizeof(float), audio_features.size(), fdump);
+            fclose(fdump);
+            fprintf(stderr, "Dumped audio_features [%d,%d] -> %s\n", dims[0], dims[1], dp);
+        }
+    }
     
     if (params.print_progress) {
         fprintf(stderr, "Audio features: [%d, %d]\n", n_audio_frames, text_hparams.hidden_size);
@@ -131,6 +141,10 @@ transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_sam
     result.t_decode_ms = get_time_ms() - t_decode_start;
     
     result.tokens = output_tokens;
+    if (const char* tp = getenv("QWEN_DUMP_TOKENS")) {
+        FILE* ft = fopen(tp, "wb");
+        if (ft) { int32_t n=(int32_t)output_tokens.size(); fwrite(&n,sizeof(int32_t),1,ft); fwrite(output_tokens.data(),sizeof(int32_t),n,ft); fclose(ft); }
+    }
     result.text = decoder_.decode_tokens(output_tokens);
     result.success = true;
     
@@ -247,6 +261,7 @@ bool Qwen3ASR::decode_greedy(const std::vector<int32_t> & input_tokens,
     }
     
     int32_t n_past = n_input;
+    decoder_.switch_kv_to_cpu(n_past); // prefill done on GPU; run token loop on CPU
     
     while (next_token != cfg.eos_token_id && 
            (int32_t)output_tokens.size() < params.max_tokens) {
@@ -280,6 +295,22 @@ bool Qwen3ASR::decode_greedy(const std::vector<int32_t> & input_tokens,
         output_tokens.pop_back();
     }
     
+    if (getenv("QWEN_SPEC_BENCH")) {
+        const char* be = getenv("QWEN_FORCE_CPU_VERIFY") ? "CPU" : "GPU";
+        fprintf(stderr, "\n=== SPEC VERIFY BENCH (%s sched for K>1) n_past=%d ===\n", be, (int)n_past);
+        std::vector<float> lg;
+        double c1=0;
+        for (int K : {1,2,4,8,16}) {
+            std::vector<int32_t> toks(K, (int32_t)output_tokens[0]);
+            decoder_.forward(toks.data(), K, n_input, lg); // warmup
+            int64_t t0 = get_time_ms(); int reps=5;
+            for (int r=0;r<reps;r++) decoder_.forward(toks.data(), K, n_input, lg);
+            double ms=(double)(get_time_ms()-t0)/reps, mspt=ms/K;
+            if (K==1) c1=mspt;
+            fprintf(stderr, "  verify K=%2d : %7.1f ms total | %6.1f ms/tok | ceiling %.2fx\n",
+                    K, ms, mspt, c1/mspt);
+        }
+    }
     return true;
 }
 

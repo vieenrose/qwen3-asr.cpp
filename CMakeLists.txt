@@ -59,6 +59,7 @@ target_link_libraries(audio_encoder PUBLIC
     ggml
     ggml-base
     ggml-cpu
+    ggml-cuda
     Threads::Threads
 )
 
@@ -77,6 +78,7 @@ target_link_libraries(text_decoder PUBLIC
     ggml
     ggml-base
     ggml-cpu
+    ggml-cuda
     Threads::Threads
 )
 
@@ -120,6 +122,7 @@ target_link_libraries(forced_aligner PUBLIC
     ggml
     ggml-base
     ggml-cpu
+    ggml-cuda
     Threads::Threads
 )
 
@@ -190,6 +193,7 @@ target_link_libraries(test_embedding PRIVATE
     ggml
     ggml-base
     ggml-cpu
+    ggml-cuda
     Threads::Threads
 )
 

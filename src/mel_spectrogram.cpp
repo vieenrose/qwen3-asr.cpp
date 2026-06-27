@@ -1,3 +1,4 @@
+#include "mel_cufft.h"
 #include "mel_spectrogram.h"
 
 #include <algorithm>
@@ -567,9 +568,13 @@ bool log_mel_spectrogram(const float* samples, int n_samples,
     }
 
 #else
-    const double* hann = global_cache.hann_window;
-
     std::vector<double> temp_data(mel.n_mel * compute_frames);
+    bool used_gpu = qwen3_mel_cufft(samples_padded.data(), (int)samples_padded.size(),
+                                    compute_frames, frame_size, frame_step,
+                                    global_cache.hann_window_f, filters.data.data(),
+                                    mel.n_mel, n_fft, temp_data.data());
+    const double* hann = global_cache.hann_window;
+    if (!used_gpu)
 
     for (int i = 0; i < compute_frames; i++) {
         const int offset = i * frame_step;

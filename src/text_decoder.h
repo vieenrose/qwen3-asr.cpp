@@ -80,6 +80,10 @@ struct text_decoder_model {
 struct kv_cache {
     std::vector<struct ggml_tensor *> k_cache;  // Per-layer K cache
     std::vector<struct ggml_tensor *> v_cache;  // Per-layer V cache
+    std::vector<struct ggml_tensor *> k_cache_cpu;  // CPU mirror (per-token decode runs on CPU)
+    std::vector<struct ggml_tensor *> v_cache_cpu;
+    ggml_backend_buffer_t buffer_cpu = nullptr;
+    struct ggml_context * ctx_cpu = nullptr;
     
     struct ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
@@ -96,6 +100,8 @@ struct text_decoder_state {
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_t backend_gpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
+    ggml_backend_sched_t sched_cpu = nullptr; // CPU-only: per-token decode is faster on CPU
+    bool kv_on_cpu = false; // true after switch_kv_to_cpu -> route ALL forwards to sched_cpu
     
     std::vector<uint8_t> compute_meta;
     
@@ -113,6 +119,7 @@ public:
     
     // Initialize KV cache for given context length
     bool init_kv_cache(int32_t n_ctx);
+    void switch_kv_to_cpu(int32_t n_past); // copy GPU KV->CPU + activate CPU cache
     
     // Clear KV cache (for new sequence)
     void clear_kv_cache();

@@ -293,7 +293,7 @@ bool GGUFLoader::load_tensor_data(const std::string & path, struct gguf_context 
     // Try GPU device buffer (zero-copy on Apple Silicon unified memory)
     ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
     if (gpu_dev) {
-        model.buffer = ggml_backend_dev_buffer_from_host_ptr(gpu_dev, data_base, total_size, max_tensor_size);
+        model.buffer = nullptr; // b2a092a7 CUDA backend has null buffer_from_host_ptr iface -> use CPU buffer; sched copies to GPU
     }
     if (!model.buffer) {
         model.buffer = ggml_backend_cpu_buffer_from_ptr(data_base, total_size);

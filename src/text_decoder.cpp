@@ -22,6 +22,10 @@ TextDecoder::~TextDecoder() {
         ggml_backend_sched_free(state_.sched);
         state_.sched = nullptr;
     }
+    if (state_.sched_cpu) {
+        ggml_backend_sched_free(state_.sched_cpu);
+        state_.sched_cpu = nullptr;
+    }
     if (state_.backend_gpu) {
         ggml_backend_free(state_.backend_gpu);
         state_.backend_gpu = nullptr;
@@ -104,6 +108,13 @@ bool TextDecoder::load_model(const std::string & model_path) {
     if (!state_.sched) {
         error_msg_ = "Failed to create backend scheduler";
         return false;
+    }
+    // CPU-only scheduler for the autoregressive per-token loop (batch-1 ops are 3.7x faster on CPU
+    // than GPU here: GPU launch + per-token weight-copy overhead dwarfs the tiny matmul).
+    if (state_.backend_gpu) {
+        ggml_backend_t cpu_only[1] = { state_.backend_cpu };
+        ggml_backend_buffer_type_t cpu_only_buft[1] = { ggml_backend_get_default_buffer_type(state_.backend_cpu) };
+        state_.sched_cpu = ggml_backend_sched_new(cpu_only, cpu_only_buft, 1, QWEN3_ASR_MAX_NODES, false, true);
     }
     
     state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_ASR_MAX_NODES + ggml_graph_overhead());
@@ -304,7 +315,7 @@ bool TextDecoder::load_tensor_data(const std::string & path, struct gguf_context
     // Try GPU device buffer (zero-copy on Apple Silicon unified memory)
     ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
     if (gpu_dev) {
-        model_.buffer = ggml_backend_dev_buffer_from_host_ptr(gpu_dev, data_base, total_size, max_tensor_size);
+        model_.buffer = nullptr; // b2a092a7 CUDA backend: null buffer_from_host_ptr iface -> CPU buffer + sched copies
     }
     if (!model_.buffer) {
         model_.buffer = ggml_backend_cpu_buffer_from_ptr(data_base, total_size);
@@ -333,6 +344,7 @@ bool TextDecoder::load_tensor_data(const std::string & path, struct gguf_context
 }
 
 bool TextDecoder::init_kv_cache(int32_t n_ctx) {
+    state_.kv_on_cpu = false;
     const auto & cfg = model_.config;
     
     free_kv_cache(state_.cache);
@@ -379,8 +391,43 @@ bool TextDecoder::init_kv_cache(int32_t n_ctx) {
         error_msg_ = "Failed to allocate KV cache buffer";
         return false;
     }
-    
+
+    // Parallel CPU KV cache for the per-token decode loop (runs on the CPU sched).
+    if (state_.backend_gpu) {
+        struct ggml_init_params cparams = { ctx_size, nullptr, true };
+        state_.cache.ctx_cpu = ggml_init(cparams);
+        state_.cache.k_cache_cpu.resize(cfg.n_decoder_layers);
+        state_.cache.v_cache_cpu.resize(cfg.n_decoder_layers);
+        for (int il = 0; il < cfg.n_decoder_layers; ++il) {
+            state_.cache.k_cache_cpu[il] = ggml_new_tensor_3d(state_.cache.ctx_cpu, GGML_TYPE_F16, cfg.head_dim, cfg.n_key_value_heads, n_ctx);
+            ggml_format_name(state_.cache.k_cache_cpu[il], "k_cache_cpu_%d", il);
+            state_.cache.v_cache_cpu[il] = ggml_new_tensor_3d(state_.cache.ctx_cpu, GGML_TYPE_F16, cfg.head_dim, cfg.n_key_value_heads, n_ctx);
+            ggml_format_name(state_.cache.v_cache_cpu[il], "v_cache_cpu_%d", il);
+        }
+        state_.cache.buffer_cpu = ggml_backend_alloc_ctx_tensors(state_.cache.ctx_cpu, state_.backend_cpu);
+    }
+
     return true;
+}
+
+void TextDecoder::switch_kv_to_cpu(int32_t n_past) {
+    if (!state_.backend_gpu || state_.cache.k_cache_cpu.empty() || n_past <= 0) return;
+    std::vector<uint8_t> tmp;
+    for (int il = 0; il < state_.cache.n_layers; ++il) {
+        struct ggml_tensor * kg = state_.cache.k_cache[il];
+        struct ggml_tensor * vg = state_.cache.v_cache[il];
+        size_t kb = (size_t)n_past * kg->nb[2];
+        size_t vb = (size_t)n_past * vg->nb[2];
+        size_t mx = kb > vb ? kb : vb;
+        if (tmp.size() < mx) tmp.resize(mx);
+        ggml_backend_tensor_get(kg, tmp.data(), 0, kb);
+        ggml_backend_tensor_set(state_.cache.k_cache_cpu[il], tmp.data(), 0, kb);
+        ggml_backend_tensor_get(vg, tmp.data(), 0, vb);
+        ggml_backend_tensor_set(state_.cache.v_cache_cpu[il], tmp.data(), 0, vb);
+        state_.cache.k_cache[il] = state_.cache.k_cache_cpu[il];
+        state_.cache.v_cache[il] = state_.cache.v_cache_cpu[il];
+    }
+    state_.kv_on_cpu = true;
 }
 
 void TextDecoder::clear_kv_cache() {
@@ -528,14 +575,15 @@ struct ggml_cgraph * TextDecoder::build_graph(
             head_dim, n_kv_head, n_kv,
             v_cache->nb[1], v_cache->nb[2], 0);
         
-        // flash_attn_ext expects: Q[head_dim, n_tokens, n_head], K[head_dim, n_kv, n_kv_head], V[head_dim, n_kv, n_kv_head]
-        struct ggml_tensor * Qfa = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
-        K = ggml_permute(ctx0, K, 0, 2, 1, 3);
-        V = ggml_permute(ctx0, V, 0, 2, 1, 3);
-        
-        cur = ggml_flash_attn_ext(ctx0, Qfa, K, V, fa_mask, KQscale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
-        cur = ggml_reshape_2d(ctx0, cur, n_head * head_dim, n_tokens);
+        // Manual attention (flash_attn_ext: no sm_53 CUDA kernel + needs GGML_KQ_MASK_PAD; soft_max_ext path)
+        struct ggml_tensor * Qp = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);  // [head_dim, n_tokens, n_head]
+        K = ggml_permute(ctx0, K, 0, 2, 1, 3);                          // [head_dim, n_kv, n_kv_head]
+        struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Qp);            // [n_kv, n_tokens, n_head] (GQA broadcast)
+        struct ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, fa_mask, KQscale, 0.0f);
+        struct ggml_tensor * Vt = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 2, 0, 3)); // [n_kv, head_dim, n_kv_head]
+        struct ggml_tensor * KQV = ggml_mul_mat(ctx0, Vt, KQ_soft_max); // [head_dim, n_tokens, n_head]
+        struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3); // [head_dim, n_head, n_tokens]
+        cur = ggml_cont_2d(ctx0, KQV_merged, n_head * head_dim, n_tokens);
         
         cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
         cur = ggml_add(ctx0, cur, inpL);
@@ -608,8 +656,10 @@ bool TextDecoder::forward_with_audio(
     
     struct ggml_cgraph * gf = build_graph(tokens, n_tokens, n_past,
                                           audio_embd, n_audio, audio_start_pos);
+    // batch-1 (per-token) -> CPU sched; prefill (n_tokens>1) -> GPU sched
+    ggml_backend_sched_t sched = (state_.kv_on_cpu && state_.sched_cpu) ? state_.sched_cpu : state_.sched;
     
-    if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
         error_msg_ = "Failed to allocate graph";
         return false;
     }
@@ -617,7 +667,7 @@ bool TextDecoder::forward_with_audio(
     struct ggml_tensor * inp_tokens = ggml_graph_get_tensor(gf, "inp_tokens");
     if (!inp_tokens) {
         error_msg_ = "Failed to find inp_tokens tensor";
-        ggml_backend_sched_reset(state_.sched);
+        ggml_backend_sched_reset(sched);
         return false;
     }
     ggml_backend_tensor_set(inp_tokens, tokens, 0, n_tokens * sizeof(int32_t));
@@ -655,9 +705,9 @@ bool TextDecoder::forward_with_audio(
     
     {
         QWEN3_TIMER("decoder.compute");
-        if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
+        if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
             error_msg_ = "Failed to compute graph";
-            ggml_backend_sched_reset(state_.sched);
+            ggml_backend_sched_reset(sched);
             return false;
         }
     }
@@ -665,7 +715,7 @@ bool TextDecoder::forward_with_audio(
     struct ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     if (!logits) {
         error_msg_ = "Failed to find logits tensor";
-        ggml_backend_sched_reset(state_.sched);
+        ggml_backend_sched_reset(sched);
         return false;
     }
     
@@ -676,7 +726,7 @@ bool TextDecoder::forward_with_audio(
     
     state_.cache.n_used = n_past + n_tokens;
     
-    ggml_backend_sched_reset(state_.sched);
+    ggml_backend_sched_reset(sched);
     
     return true;
 }
@@ -788,6 +838,10 @@ void free_kv_cache(kv_cache & cache) {
         ggml_free(cache.ctx);
         cache.ctx = nullptr;
     }
+    if (cache.buffer_cpu) { ggml_backend_buffer_free(cache.buffer_cpu); cache.buffer_cpu = nullptr; }
+    if (cache.ctx_cpu) { ggml_free(cache.ctx_cpu); cache.ctx_cpu = nullptr; }
+    cache.k_cache_cpu.clear();
+    cache.v_cache_cpu.clear();
     cache.k_cache.clear();
     cache.v_cache.clear();
     cache.n_ctx = 0;
