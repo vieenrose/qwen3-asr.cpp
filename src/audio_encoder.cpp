@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 
 #define QWEN3_ASR_MAX_NODES 4096
 
@@ -344,19 +346,28 @@ bool AudioEncoder::encode(const float * mel_data, int n_mel, int n_frames,
     
     std::vector<float> all_conv_outputs;
     all_conv_outputs.reserve(total_output_frames * n_state);
-    
+
+    const bool cprof = getenv("QWEN_CONV_PROFILE") != nullptr;
+    double cms_build = 0, cms_alloc = 0, cms_comp = 0;
+    using cclk = std::chrono::steady_clock;
+    auto CNOW = [] { return cclk::now(); };
+    auto CMS = [](cclk::time_point a, cclk::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count(); };
+
     for (int chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
         QWEN3_TIMER("audio_encoding.conv_chunk");
         int chunk_start = chunk_idx * chunk_size;
         int chunk_len = chunk_lengths[chunk_idx];
         int chunk_out_len = chunk_output_lengths[chunk_idx];
-        
+
+        auto cb0 = CNOW();
         struct ggml_cgraph * gf_conv = build_graph_conv(chunk_len);
-        
+        auto cb1 = CNOW();
         if (!ggml_backend_sched_alloc_graph(state_.sched, gf_conv)) {
             error_msg_ = "Failed to allocate conv graph for chunk " + std::to_string(chunk_idx);
             return false;
         }
+        auto cb2 = CNOW();
         
         struct ggml_tensor * mel_tensor = ggml_graph_get_tensor(gf_conv, "mel");
         if (!mel_tensor) {
@@ -373,12 +384,15 @@ bool AudioEncoder::encode(const float * mel_data, int n_mel, int n_frames,
         }
         
         ggml_backend_tensor_set(mel_tensor, chunk_mel.data(), 0, n_mel * chunk_len * sizeof(float));
-        
+
+        auto cb3 = CNOW();
         if (ggml_backend_sched_graph_compute(state_.sched, gf_conv) != GGML_STATUS_SUCCESS) {
             error_msg_ = "Failed to compute conv graph for chunk " + std::to_string(chunk_idx);
             ggml_backend_sched_reset(state_.sched);
             return false;
         }
+        if (cprof) { cms_build += CMS(cb0, cb1); cms_alloc += CMS(cb1, cb2);
+                     cms_comp += CMS(cb3, CNOW()); }
         
         struct ggml_tensor * embd_conv = ggml_graph_get_tensor(gf_conv, "embd_conv");
         if (!embd_conv) {
@@ -404,8 +418,13 @@ bool AudioEncoder::encode(const float * mel_data, int n_mel, int n_frames,
         }
         
         all_conv_outputs.insert(all_conv_outputs.end(), chunk_output.begin(), chunk_output.end());
-        
+
         ggml_backend_sched_reset(state_.sched);
+    }
+    if (cprof) {
+        fprintf(stderr, "[conv-profile] %d chunks: build=%.1f alloc=%.1f compute=%.1f ms "
+                "(per-chunk %.1f/%.1f/%.1f)\n", n_chunks, cms_build, cms_alloc, cms_comp,
+                cms_build / n_chunks, cms_alloc / n_chunks, cms_comp / n_chunks);
     }
     
     int64_t n_ctx = total_output_frames;
